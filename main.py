@@ -1,138 +1,87 @@
-import ccxt, pandas as pd, ta, time, datetime
-from telegram import *
-from telegram.ext import *
-from config import *
-from db import conn, cur
+import ccxt
+import pandas as pd
+import ta
+import time
+import asyncio
 
-# ===== OKX =====
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
+
+from config import *
+
+# ================= EXCHANGE =================
 exchange = ccxt.okx({
     "apiKey": OKX_API_KEY,
     "secret": OKX_SECRET,
-    "password": OKX_PASSWORD
+    "password": OKX_PASSWORD,
 })
 
-# ===== DATA =====
+# ================= DATA =================
 def get_data():
-    df = pd.DataFrame(
-        exchange.fetch_ohlcv(SYMBOL, '15m', limit=200),
-        columns=["t","o","h","l","c","v"]
-    )
+    ohlcv = exchange.fetch_ohlcv(SYMBOL, timeframe="15m", limit=100)
+    df = pd.DataFrame(ohlcv, columns=["t","o","h","l","c","v"])
 
     df["rsi"] = ta.momentum.RSIIndicator(df["c"]).rsi()
-    df["ema20"] = ta.trend.ema_indicator(df["c"], 20)
-    df["ema50"] = ta.trend.ema_indicator(df["c"], 50)
-    df["vol_ma"] = df["v"].rolling(20).mean()
-
     return df
 
-# ===== STRATEGY =====
+# ================= SIGNAL =================
 def generate_signal():
     df = get_data()
     last = df.iloc[-1]
 
-    high = df["h"].rolling(30).max().iloc[-1]
-    low = df["l"].rolling(30).min().iloc[-1]
+    high = df["h"].rolling(20).max().iloc[-1]
+    low = df["l"].rolling(20).min().iloc[-1]
 
     if last["c"] > high:
-        return "LONG", df
+        return "LONG", last["c"]
 
     if last["c"] < low:
-        return "SHORT", df
+        return "SHORT", last["c"]
 
-    return None, df
+    return None, None
 
-# ===== AI FILTER =====
-def ai_filter(df, direction):
-    last = df.iloc[-1]
-    score = 50
+# ================= TELEGRAM =================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Bot is running...")
 
-    if last["v"] > last["vol_ma"]:
-        score += 15
-
-    if 40 < last["rsi"] < 60:
-        score += 10
-
-    if direction == "LONG" and last["ema20"] > last["ema50"]:
-        score += 10
-
-    if direction == "SHORT" and last["ema20"] < last["ema50"]:
-        score += 10
-
-    return score
-
-# ===== RISK =====
-def position_size(balance, entry, sl):
-    risk = balance * RISK_PER_TRADE
-    return round(risk / abs(entry - sl), 3)
-
-def trades_today():
-    return cur.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
-
-# ===== TELEGRAM =====
-async def start(update, context):
-    await update.message.reply_text("Send 12-digit code to activate")
-
-async def handle(update, context):
-    uid = update.effective_user.id
-    txt = update.message.text
-
-    if txt.isdigit() and len(txt) == 12:
-        cur.execute("INSERT OR REPLACE INTO users VALUES (?,1)", (uid,))
-        conn.commit()
-        await update.message.reply_text("✅ Activated")
-
-# ===== SIGNAL LOOP =====
-async def signal_loop(app):
+# ================= SEND SIGNAL =================
+async def send_signal(app):
     while True:
         try:
-            direction, df = generate_signal()
+            signal, price = generate_signal()
 
-            if not direction:
-                time.sleep(60)
-                continue
+            if signal:
+                tp = price * 1.02 if signal == "LONG" else price * 0.98
+                sl = price * 0.99 if signal == "LONG" else price * 1.01
 
-            score = ai_filter(df, direction)
+                keyboard = [[
+                    InlineKeyboardButton("✅ Confirm", callback_data=f"{signal}|{price}|{tp}|{sl}"),
+                    InlineKeyboardButton("❌ Cancel", callback_data="cancel")
+                ]]
 
-            if score < 70:
-                time.sleep(60)
-                continue
-
-            entry = df["c"].iloc[-1]
-            tp = entry * (1.02 if direction == "LONG" else 0.98)
-            sl = entry * (0.99 if direction == "LONG" else 1.01)
-
-            msg = f"""
+                msg = f"""
 📊 SIGNAL
 
-Direction: {direction}
-Entry: {entry:.2f}
-TP: {tp:.2f}
-SL: {sl:.2f}
-
-AI Score: {score}
+Direction: {signal}
+Entry: {price}
+TP: {tp}
+SL: {sl}
 """
 
-            keyboard = [[
-                InlineKeyboardButton("✅ Confirm",
-                    callback_data=f"{entry}|{tp}|{sl}|{direction}"),
-                InlineKeyboardButton("❌ Cancel", callback_data="cancel")
-            ]]
-
-            users = cur.execute("SELECT user_id FROM users WHERE approved=1").fetchall()
-
-            for u in users:
                 await app.bot.send_message(
-                    u[0], msg,
+                    chat_id=app.bot_data["chat_id"],
+                    text=msg,
                     reply_markup=InlineKeyboardMarkup(keyboard)
                 )
 
+            await asyncio.sleep(60)
+
         except Exception as e:
-            print("ERROR:", e)
+            print("error:", e)
+            await asyncio.sleep(10)
 
-        time.sleep(60)
-
-# ===== EXECUTION =====
-async def buttons(update, context):
+# ================= BUTTONS =================
+async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
 
@@ -140,79 +89,40 @@ async def buttons(update, context):
         await q.edit_message_text("❌ Canceled")
         return
 
-    entry, tp, sl, direction = q.data.split("|")
-    entry, tp, sl = float(entry), float(tp), float(sl)
+    signal, price, tp, sl = q.data.split("|")
 
-    balance = 1000
-    size = position_size(balance, entry, sl)
+    price = float(price)
+    tp = float(tp)
+    sl = float(sl)
 
-    side = "buy" if direction == "LONG" else "sell"
+    side = "buy" if signal == "LONG" else "sell"
 
     try:
-        exchange.create_market_order(SYMBOL, side, size)
-
-        exchange.create_order(
+        order = exchange.create_market_order(
             SYMBOL,
-            "limit",
-            "sell" if direction == "LONG" else "buy",
-            size,
-            tp
+            side,
+            0.01
         )
 
-        cur.execute("""
-        INSERT INTO trades (entry,tp,sl,direction,status,pnl)
-        VALUES (?,?,?,?,?,?)
-        """, (entry, tp, sl, direction, "open", 0))
-        conn.commit()
-
-        await q.edit_message_text("✅ Trade opened")
+        await q.edit_message_text("✅ TRADE EXECUTED")
 
     except Exception as e:
-        await q.edit_message_text(f"Error: {e}")
+        await q.edit_message_text(f"ERROR: {e}")
 
-# ===== TRACK TRADES =====
-def track_trades():
-    while True:
-        trades = cur.execute("SELECT * FROM trades WHERE status='open'").fetchall()
-        price = exchange.fetch_ticker(SYMBOL)["last"]
-
-        for t in trades:
-            id, entry, tp, sl, direction, _, _ = t
-
-            if direction == "LONG":
-                if price >= tp:
-                    pnl = tp - entry
-                    cur.execute("UPDATE trades SET status='win', pnl=? WHERE id=?", (pnl, id))
-                elif price <= sl:
-                    pnl = sl - entry
-                    cur.execute("UPDATE trades SET status='loss', pnl=? WHERE id=?", (pnl, id))
-
-            if direction == "SHORT":
-                if price <= tp:
-                    pnl = entry - tp
-                    cur.execute("UPDATE trades SET status='win', pnl=? WHERE id=?", (pnl, id))
-                elif price >= sl:
-                    pnl = entry - sl
-                    cur.execute("UPDATE trades SET status='loss', pnl=? WHERE id=?", (pnl, id))
-
-        conn.commit()
-        time.sleep(20)
-
-# ===== MAIN =====
+# ================= MAIN =================
 async def main():
     app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT, handle))
     app.add_handler(CallbackQueryHandler(buttons))
 
-    app.create_task(signal_loop(app))
+    # chat id (βάλε το δικό σου telegram id εδώ)
+    app.bot_data["chat_id"] = 123456789
 
-    import threading
-    threading.Thread(target=track_trades).start()
+    asyncio.create_task(send_signal(app))
 
-    print("🚀 BOT RUNNING...")
+    print("BOT RUNNING")
     await app.run_polling()
 
-import asyncio
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
