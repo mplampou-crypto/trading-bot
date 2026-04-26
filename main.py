@@ -1,13 +1,22 @@
+import os
 import ccxt
 import pandas as pd
 import ta
-import time
 import asyncio
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
 
-from config import *
+# ================= ENV VARIABLES =================
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+OKX_API_KEY = os.getenv("OKX_API_KEY")
+OKX_SECRET = os.getenv("OKX_SECRET")
+OKX_PASSWORD = os.getenv("OKX_PASSWORD")
+
+SYMBOL = "AAVE/USDT"
+
+# 👉 ΒΑΛΕ ΤΟ TELEGRAM ID ΣΟΥ
+CHAT_ID = 123456789
 
 # ================= EXCHANGE =================
 exchange = ccxt.okx({
@@ -40,11 +49,7 @@ def generate_signal():
 
     return None, None
 
-# ================= TELEGRAM =================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Bot is running...")
-
-# ================= SEND SIGNAL =================
+# ================= SIGNAL LOOP =================
 async def send_signal(app):
     while True:
         try:
@@ -63,13 +68,13 @@ async def send_signal(app):
 📊 SIGNAL
 
 Direction: {signal}
-Entry: {price}
-TP: {tp}
-SL: {sl}
+Entry: {price:.2f}
+TP: {tp:.2f}
+SL: {sl:.2f}
 """
 
                 await app.bot.send_message(
-                    chat_id=app.bot_data["chat_id"],
+                    chat_id=CHAT_ID,
                     text=msg,
                     reply_markup=InlineKeyboardMarkup(keyboard)
                 )
@@ -77,16 +82,16 @@ SL: {sl}
             await asyncio.sleep(60)
 
         except Exception as e:
-            print("error:", e)
+            print("ERROR:", e)
             await asyncio.sleep(10)
 
-# ================= BUTTONS =================
+# ================= BUTTON HANDLER =================
 async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
 
     if q.data == "cancel":
-        await q.edit_message_text("❌ Canceled")
+        await q.edit_message_text("❌ Trade canceled")
         return
 
     signal, price, tp, sl = q.data.split("|")
@@ -98,30 +103,35 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     side = "buy" if signal == "LONG" else "sell"
 
     try:
-        order = exchange.create_market_order(
+        exchange.create_market_order(
             SYMBOL,
             side,
-            0.01
+            0.01  # μικρό ποσό για αρχή
         )
 
         await q.edit_message_text("✅ TRADE EXECUTED")
 
     except Exception as e:
-        await q.edit_message_text(f"ERROR: {e}")
+        await q.edit_message_text(f"❌ ERROR: {e}")
+
+# ================= START =================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🤖 Bot is running")
 
 # ================= MAIN =================
 async def main():
+    if not TOKEN:
+        print("❌ TELEGRAM TOKEN NOT FOUND")
+        return
+
     app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(buttons))
 
-    # chat id (βάλε το δικό σου telegram id εδώ)
-    app.bot_data["chat_id"] = 123456789
-
     asyncio.create_task(send_signal(app))
 
-    print("BOT RUNNING")
+    print("🚀 BOT RUNNING...")
     await app.run_polling()
 
 if __name__ == "__main__":
