@@ -17,7 +17,7 @@ OKX_SECRET = os.getenv("OKX_SECRET")
 OKX_PASSWORD = os.getenv("OKX_PASSWORD")
 
 SYMBOL = "AAVE/USDT"
-ADMIN_ID = 123456789
+ADMIN_ID =  5313104598
 GROUP_LINK = "https://t.me/yourgroup"
 
 # ===== DATABASE =====
