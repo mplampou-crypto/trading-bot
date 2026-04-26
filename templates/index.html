@@ -1,0 +1,12 @@
+<h1>AAVE Dashboard</h1>
+
+<p>PnL: {{pnl}}</p>
+<p>Winrate: {{winrate}}%</p>
+
+<table border="1">
+{% for t in trades %}
+<tr>
+<td>{{t}}</td>
+</tr>
+{% endfor %}
+</table>
