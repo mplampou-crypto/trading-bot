@@ -1,6 +1,6 @@
 python-telegram-bot==20.7
-ccxt
+ccxt==4.3.93
 pandas
 ta
-scikit-learn
 numpy
+scikit-learn
