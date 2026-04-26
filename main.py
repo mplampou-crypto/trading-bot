@@ -1,5 +1,6 @@
-import os, asyncio, ccxt, pandas as pd, ta, numpy as np
+import os, asyncio, ccxt, pandas as pd, ta, numpy as np, sqlite3
 from sklearn.ensemble import RandomForestClassifier
+from datetime import datetime, timedelta
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -19,9 +20,95 @@ SYMBOL = "AAVE/USDT"
 ADMIN_ID = 123456789   # ΒΑΛΕ ΤΟ ΔΙΚΟ ΣΟΥ TELEGRAM ID
 GROUP_LINK = "https://t.me/yourgroup"
 
-# ===== USERS =====
-users = {}
-pending = {}
+# ===== DATABASE =====
+def init_db():
+    conn = sqlite3.connect("users.db")
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id     INTEGER PRIMARY KEY,
+            username    TEXT,
+            plan        TEXT,
+            approved    INTEGER DEFAULT 0,
+            expiry      TEXT
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS pending (
+            user_id     INTEGER PRIMARY KEY,
+            username    TEXT,
+            plan        TEXT,
+            paysafe     TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def db_approve(user_id, plan):
+    conn = sqlite3.connect("users.db")
+    c = conn.cursor()
+    months = 1 if plan == "sub1" else 6
+    expiry = (datetime.now() + timedelta(days=30 * months)).strftime("%Y-%m-%d")
+    c.execute("""
+        INSERT INTO users (user_id, plan, approved, expiry)
+        VALUES (?, ?, 1, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            plan=excluded.plan, approved=1, expiry=excluded.expiry
+    """, (user_id, plan, expiry))
+    c.execute("DELETE FROM pending WHERE user_id=?", (user_id,))
+    conn.commit()
+    conn.close()
+    return expiry
+
+def db_reject(user_id):
+    conn = sqlite3.connect("users.db")
+    c = conn.cursor()
+    c.execute("DELETE FROM pending WHERE user_id=?", (user_id,))
+    conn.commit()
+    conn.close()
+
+def db_add_pending(user_id, username, plan, paysafe):
+    conn = sqlite3.connect("users.db")
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO pending (user_id, username, plan, paysafe)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            plan=excluded.plan, paysafe=excluded.paysafe
+    """, (user_id, username, plan, paysafe))
+    conn.commit()
+    conn.close()
+
+def db_get_pending(user_id):
+    conn = sqlite3.connect("users.db")
+    c = conn.cursor()
+    c.execute("SELECT plan, paysafe FROM pending WHERE user_id=?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    return row  # (plan, paysafe) or None
+
+def db_get_approved_users():
+    conn = sqlite3.connect("users.db")
+    c = conn.cursor()
+    c.execute("SELECT user_id, expiry FROM users WHERE approved=1")
+    rows = c.fetchall()
+    conn.close()
+    return rows  # list of (user_id, expiry)
+
+def db_is_approved(user_id):
+    conn = sqlite3.connect("users.db")
+    c = conn.cursor()
+    c.execute("SELECT approved, expiry FROM users WHERE user_id=?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        return False
+    approved, expiry = row
+    if not approved:
+        return False
+    if datetime.strptime(expiry, "%Y-%m-%d") < datetime.now():
+        return False
+    return True
 
 # ===== EXCHANGE =====
 exchange = ccxt.okx({
@@ -43,6 +130,7 @@ def get_data():
     return df.dropna()
 
 def build_features(df):
+    df = df.copy()
     df["target"] = (df["c"].shift(-3) > df["c"]).astype(int)
     df = df.dropna()
     X = df[["rsi","ema20","ema50","v"]]
@@ -61,9 +149,7 @@ def ml_score(df):
     if not trained:
         train_model()
     last = df.iloc[-1]
-    features = np.array([[
-        last["rsi"], last["ema20"], last["ema50"], last["v"]
-    ]])
+    features = np.array([[last["rsi"], last["ema20"], last["ema50"], last["v"]]])
     prob = model.predict_proba(features)[0][1]
     return prob * 100
 
@@ -80,12 +166,16 @@ def leverage(score):
 def signal(df):
     last = df.iloc[-1]
     high = df["h"].rolling(20).max().iloc[-1]
-    low = df["l"].rolling(20).min().iloc[-1]
+    low  = df["l"].rolling(20).min().iloc[-1]
     if last["c"] > high:
         return "LONG", last["c"]
     if last["c"] < low:
         return "SHORT", last["c"]
     return None, None
+
+# ===== USER STATE (για να ξέρουμε τι περιμένουμε από κάθε user) =====
+# "await_paysafe" = περιμένει paysafe code
+user_state = {}
 
 # ===== START =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -103,43 +193,138 @@ async def choose_sub(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
-    pending[uid] = q.data
+
+    # Αποθήκευσε επιλογή στο state
+    user_state[uid] = {"step": "await_paysafe", "plan": q.data}
+
+    plan_text = "25€ / 1 μήνα" if q.data == "sub1" else "100€ / 6 μήνες"
+
     await q.edit_message_text(
-        "📩 Στείλε proof πληρωμής (screenshot ή tx hash)"
+        f"✅ Επέλεξες: {plan_text}\n\n"
+        f"📩 Στείλε τον 12ψήφιο κωδικό PaySafe:\n"
+        f"(π.χ. 123456789012)"
     )
 
-# ===== HANDLE PROOF =====
-async def proof(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ===== HANDLE MESSAGES =====
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if uid not in pending:
-        return
-    await context.bot.send_message(
-        chat_id=ADMIN_ID,
-        text=f"🧾 User {uid} sent payment proof\n/approve {uid}\n/reject {uid}"
-    )
-    await update.message.reply_text("⏳ Περιμένεις approval")
+    text = update.message.text.strip()
 
-# ===== ADMIN =====
-async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    state = user_state.get(uid, {})
+
+    # ===== ΑΝΑΜΕΝΟΥΜΕ PAYSAFE =====
+    if state.get("step") == "await_paysafe":
+
+        # Έλεγχος: μόνο αριθμοί και ακριβώς 12 ψηφία
+        if not text.isdigit() or len(text) != 12:
+            await update.message.reply_text(
+                "❌ Μη έγκυρος κωδικός!\n\n"
+                "Ο κωδικός PaySafe πρέπει να είναι ακριβώς 12 αριθμοί.\n"
+                "Δοκίμασε ξανά:"
+            )
+            return
+
+        plan = state["plan"]
+        username = update.effective_user.username or str(uid)
+
+        # Αποθήκευσε στη βάση
+        db_add_pending(uid, username, plan, text)
+        user_state.pop(uid, None)
+
+        plan_text = "25€ / 1 μήνα" if plan == "sub1" else "100€ / 6 μήνες"
+
+        # Μήνυμα στον admin
+        kb_admin = [
+            [
+                InlineKeyboardButton("✅ Approve", callback_data=f"approve_{uid}"),
+                InlineKeyboardButton("❌ Reject",  callback_data=f"reject_{uid}")
+            ]
+        ]
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=(
+                f"🧾 Νέα αίτηση πληρωμής!\n\n"
+                f"👤 User: @{username} ({uid})\n"
+                f"📦 Πλάνο: {plan_text}\n"
+                f"💳 PaySafe: {text}"
+            ),
+            reply_markup=InlineKeyboardMarkup(kb_admin)
+        )
+
+        await update.message.reply_text(
+            "⏳ Ο κωδικός στάλθηκε!\nΠερίμενε έγκριση από τον admin."
+        )
+        return
+
+    # Αν δεν είναι σε κάποιο step, αγνόησε
+    return
+
+# ===== ADMIN APPROVE/REJECT BUTTONS =====
+async def admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+
+    if q.from_user.id != ADMIN_ID:
+        return
+
+    data = q.data  # "approve_12345" ή "reject_12345"
+    action, uid_str = data.split("_", 1)
+    uid = int(uid_str)
+
+    pending = db_get_pending(uid)
+
+    if not pending:
+        await q.edit_message_text("⚠️ Ο χρήστης δεν βρέθηκε στα pending.")
+        return
+
+    plan, paysafe = pending
+
+    if action == "approve":
+        expiry = db_approve(uid, plan)
+        plan_text = "25€ / 1 μήνα" if plan == "sub1" else "100€ / 6 μήνες"
+
+        kb = [[InlineKeyboardButton("🚀 Μπες στην ομάδα", url=GROUP_LINK)]]
+        await context.bot.send_message(
+            chat_id=uid,
+            text=(
+                f"✅ Εγκρίθηκες!\n\n"
+                f"📦 Πλάνο: {plan_text}\n"
+                f"📅 Λήξη: {expiry}"
+            ),
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
+        await q.edit_message_text(f"✅ Approved user {uid} — λήξη {expiry}")
+
+    elif action == "reject":
+        db_reject(uid)
+        await context.bot.send_message(
+            chat_id=uid,
+            text="❌ Ο κωδικός PaySafe απορρίφθηκε.\nΕπικοινώνησε με τον admin."
+        )
+        await q.edit_message_text(f"❌ Rejected user {uid}")
+
+# ===== ADMIN COMMANDS (manual fallback) =====
+async def approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
     uid = int(context.args[0])
-    users[uid] = True
+    pending = db_get_pending(uid)
+    if not pending:
+        await update.message.reply_text("⚠️ User δεν βρέθηκε.")
+        return
+    plan, _ = pending
+    expiry = db_approve(uid, plan)
     kb = [[InlineKeyboardButton("🚀 Μπες στην ομάδα", url=GROUP_LINK)]]
-    await context.bot.send_message(
-        chat_id=uid,
-        text="✅ Approved!",
-        reply_markup=InlineKeyboardMarkup(kb)
-    )
+    await context.bot.send_message(chat_id=uid, text=f"✅ Εγκρίθηκες! Λήξη: {expiry}", reply_markup=InlineKeyboardMarkup(kb))
+    await update.message.reply_text(f"✅ Approved {uid}")
 
-async def reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def reject_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
     uid = int(context.args[0])
-    await context.bot.send_message(
-        chat_id=uid,
-        text="❌ Payment rejected"
-    )
+    db_reject(uid)
+    await context.bot.send_message(chat_id=uid, text="❌ Απορρίφθηκες.")
+    await update.message.reply_text(f"❌ Rejected {uid}")
 
 # ===== SIGNAL LOOP =====
 async def loop(app):
@@ -172,8 +357,14 @@ async def loop(app):
                 f"⚡ Leverage: {lev}x"
             )
 
-            for uid in list(users.keys()):
+            approved = db_get_approved_users()
+            now = datetime.now()
+
+            for uid, expiry in approved:
                 try:
+                    # Έλεγχος αν έχει λήξει η συνδρομή
+                    if datetime.strptime(expiry, "%Y-%m-%d") < now:
+                        continue
                     await app.bot.send_message(uid, msg)
                 except Exception as e:
                     print(f"Failed to send to {uid}: {e}")
@@ -185,13 +376,16 @@ async def loop(app):
 
 # ===== MAIN =====
 async def main():
+    init_db()
+
     app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(choose_sub, pattern="sub"))
-    app.add_handler(MessageHandler(filters.TEXT, proof))
-    app.add_handler(CommandHandler("approve", approve))
-    app.add_handler(CommandHandler("reject", reject))
+    app.add_handler(CommandHandler("approve", approve_cmd))
+    app.add_handler(CommandHandler("reject", reject_cmd))
+    app.add_handler(CallbackQueryHandler(choose_sub, pattern="^sub"))
+    app.add_handler(CallbackQueryHandler(admin_action, pattern="^approve_|^reject_"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     async with app:
         await app.start()
