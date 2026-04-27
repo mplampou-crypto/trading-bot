@@ -12,6 +12,8 @@ from telegram.ext import (
 
 # ===== ENV =====
 TELEGRAM_TOKEN = os.getenv("8695476159:AAFlzUmjHI8WNAK95Cr3G-bdTIMPZmdpe-c")
+if not TOKEN:
+    raise ValueError("TELEGRAM_TOKEN is missing!")
 OKX_API_KEY = os.getenv("73a643a4-0b70-489a-93de-1757e6216145")
 OKX_SECRET = os.getenv(" E47E8A6C808A701BBEEDF53EDF8CD6EB")
 OKX_PASSWORD = os.getenv("Mysecurepass123#")
