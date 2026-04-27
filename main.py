@@ -11,10 +11,10 @@ from telegram.ext import (
 )
 
 # ===== ENV =====
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-OKX_API_KEY = os.getenv("OKX_API_KEY")
-OKX_SECRET = os.getenv("OKX_SECRET")
-OKX_PASSWORD = os.getenv("OKX_PASSWORD")
+TOKEN = os.getenv("8695476159:AAFlzUmjHI8WNAK95Cr3G-bdTIMPZmdpe-c")
+OKX_API_KEY = os.getenv("73a643a4-0b70-489a-93de-1757e6216145")
+OKX_SECRET = os.getenv(" E47E8A6C808A701BBEEDF53EDF8CD6EB")
+OKX_PASSWORD = os.getenv("Mysecurepass123#")
 
 SYMBOL = "AAVE/USDT"
 ADMIN_ID =  5313104598
